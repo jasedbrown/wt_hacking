@@ -1,9 +1,10 @@
 #include <fcntl.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/eventfd.h>
-#include <string.h>
 #include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/eventfd.h>
+#include <linux/stat.h>
+#include <unistd.h>
 #include "wiredtiger.h"
 #include "wiredtiger_ext.h"
 #include "liburing.h"
@@ -15,59 +16,6 @@ static const char *config;
 #define EVENT_TYPE_NORMAL   1
 #define CQE_BATCH_SIZE      16
 
-
-/* ! [JEB :: message handler] */
-// EventHandler stuffs borrowed from https://source.wiredtiger.com/develop/message_handling.html
-
-/*
- * Create our own event handler structure to allow us to pass context through to event handler
- * callbacks. For this to work the WiredTiger event handler must appear first in our custom event
- * handler structure.
- */
-typedef struct {
-    WT_EVENT_HANDLER h;
-    const char *app_id;
-} CUSTOM_EVENT_HANDLER;
- 
-/*
- * handle_wiredtiger_error --
- *     Function to handle error callbacks from WiredTiger.
- */
-int
-handle_wiredtiger_error(
-  WT_EVENT_HANDLER *handler, WT_SESSION *session, int error, const char *message)
-{
-    CUSTOM_EVENT_HANDLER *custom_handler;
- 
-    /* Cast the handler back to our custom handler. */
-    custom_handler = (CUSTOM_EVENT_HANDLER *)handler;
- 
-    /* Report the error on the console. */
-    fprintf(stderr, "ERR app_id %s, thread context %p, error %d, message %s\n", custom_handler->app_id,
-      (void *)session, error, message);
- 
-    /* Exit if the database has a fatal error. */
-    if (error == WT_PANIC)
-        exit(1);
- 
-    return (0);
-}
- 
-/*
- * handle_wiredtiger_message --
- *     Function to handle message callbacks from WiredTiger.
- */
-int
-handle_wiredtiger_message(WT_EVENT_HANDLER *handler, WT_SESSION *session, const char *message)
-{
-    /* Cast the handler back to our custom handler. */
-    fprintf(stderr, "MSG app id %s, thread context %p, message %s\n", ((CUSTOM_EVENT_HANDLER *)handler)->app_id,
-      (void *)session, message);
- 
-    return (0);
-}
-/* ! [JEB :: message handler] */
-
 /*
 * A wrapper struct to be used with io_uring SQEs and CQEs.
 */
@@ -76,9 +24,12 @@ typedef struct __ring_event_user_data {
     int lock_flag; // indicator to main thread to unblock
 
     // might just use posix cond vars ... or copy over WT's wr_condvar.
-    // tbh just need something that looks like a for now ...
+    // tbh just need something that looks like a latch for now ...
+    pthread_mutex_t mutex;
+    pthread_cond_t condvar;
 
-    // TODO: might need to capture event status ....
+    // cqe->res value
+    int ret_code;
 } RING_EVENT_USER_DATA;
 
 
@@ -157,12 +108,12 @@ fh_extend_nolock
 int init_io_uring(struct io_uring *ring, int efd) {
     struct io_uring_params params;
 
-    // if (geteuid()) {
-    //     fprintf(stderr, "You need root privileges to run this program.\n");
-    //     return 1;
-    // }
+    if (geteuid()) {
+        fprintf(stderr, "You need root privileges to run this program.\n");
+        return 1;
+    }
     memset(&params, 0, sizeof(struct io_uring_params));
-    // params.flags |= IORING_SETUP_SQPOLL;
+    params.flags |= IORING_SETUP_SQPOLL;
 
     // TODO: make idle time a config option?
     params.sq_thread_idle = 120000; // 2 minutes in ms;
@@ -196,7 +147,6 @@ void *ring_consumer(void *data) {
 
     while (!must_exit) {
         // this blocks forever ... i think :(
-        printf("about to block on eventfd\n");
         int ret = eventfd_read(fs->efd, &v);
         if (ret < 0)
             // TODO: find some better way to handle this error
@@ -208,32 +158,31 @@ void *ring_consumer(void *data) {
         // re-notified from the eventfd blocking
         while (1) {
             int cnt = io_uring_peek_batch_cqe(&fs->ring, cqes, CQE_BATCH_SIZE);
-            printf("JEB:: batch count = %d\n", cnt);
             if (!cnt) {
                 // not sure when we'd get 0 count if the eventfd triggered, unless spurious :shrug:
                 break;
             }
+            printf("JEB::ring_consumer - next batch count = %d\n", cnt);
             
             cqe = *cqes;
             for (int i = 0; i < cnt; i++, cqe++) {
-                if (cqe->res < 0) {
-                    fprintf(stderr, "async error: %s\n", strerror(-cqe->res));
-                    // cqe_seen & continue???
-                }
-
                 ud = io_uring_cqe_get_data(cqe);
                 
                 switch(ud->event_type){
                     case EVENT_TYPE_NORMAL:
-                        // TODO: bump ud.lock/flag .....
+                        // NOTE: there could be some nasty thread blocks here if the timing is unlucky 
+                        // (if the producing thread hasn't called pthread_cond_wait() yet).
+                        pthread_mutex_lock(&ud->mutex); // <- i think i need to do this, but not sure yet (or do it at submission??)
+                        ud->ret_code = cqe->res;
+                        pthread_cond_signal(&ud->condvar);
+                        pthread_mutex_unlock(&ud->mutex);
                         break;
                     case EVENT_TYPE_SHUTDOWN:
                         printf("CONSUMER:: handle shutdown event\n");
                         must_exit = true;
+                        free(ud);
                         break;
                 }
-
-                free(ud);
 
                 // TODO: see if there's a way to batch update the pointer here, instead of doing it one at a time.
                 // io_uring_for_each_cqe() has a helper function to do that, i think ....
@@ -324,7 +273,7 @@ jeb_fs_open(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name ,
     WT_FILE_HANDLE *file_handle;
     struct io_uring_sqe *sqe;
     int ret = 0;
-    int f;
+    int f = 0, fd = 0;
 
     printf("JEB::jeb_fs_open %s\n", name);
 
@@ -337,20 +286,39 @@ jeb_fs_open(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name ,
     jeb_file_handle = NULL;
     // wtext = jeb_fs->wtext;
 
+    // TODO: look to see if we've already opened the file (and have a handle to it)
+
     // TODO: inspect the flags to see if we should actually create the file, lol
     // blindly assume we'll just open the file ... cuz YOLO
-    f |= O_CREAT;
+    f |= O_CREAT | O_RDWR;
+
     sqe = io_uring_get_sqe(&jeb_fs->ring);
-    io_uring_prep_openat(sqe, NULL, name, f, 0x666);
+    io_uring_prep_openat(sqe, 0, name, f, S_IRWXU | S_IRGRP | S_IROTH);
     RING_EVENT_USER_DATA *ud = malloc(sizeof(RING_EVENT_USER_DATA));
     ud->event_type = EVENT_TYPE_NORMAL;
-
-    // TODO: set a lock/flag into the user_data struct
+    
+    /* Initialize mutex and condition variable objects */
+    pthread_mutex_init(&ud->mutex, NULL);
+    pthread_cond_init (&ud->condvar, NULL);
+    pthread_mutex_lock(&ud->mutex);
 
     io_uring_sqe_set_data(sqe, ud);
     io_uring_submit(&jeb_fs->ring);
+    
+    // this should be in a loop to deal with spurious wakeups.
+    // should probably use pthread_cond_timedwait().
+    pthread_cond_wait(&ud->condvar, &ud->mutex);
+    pthread_mutex_unlock(&ud->mutex);
+    pthread_mutex_destroy(&ud->mutex);
+    pthread_cond_destroy(&ud->condvar);
 
-    // TODO: look to see if we've already opened the file (and have a handle to it)
+    fd = ud->ret_code;
+    free(ud);
+
+    if (fd < 0) {
+        fprintf(stderr, "failed to create a new file: %s\n", strerror(ret));
+        return ret;
+    }
 
     // file isn't open, so create a new handle
     if ((jeb_file_handle = calloc(1, sizeof(JEB_FILE_HANDLE))) == NULL) {
@@ -359,6 +327,7 @@ jeb_fs_open(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name ,
     }
 
     jeb_file_handle->fs = jeb_fs;
+    jeb_file_handle->fd = fd;
 
     file_handle = (WT_FILE_HANDLE *)jeb_file_handle;
     file_handle->file_system = fs;
@@ -385,17 +354,51 @@ jeb_fs_open(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name ,
 
     *file_handlep = file_handle;
 
-    // NOW, block on the file create (via the earlier uring submit)
-
-
     return (ret);
 }
 
 /* return if file exists */
 static int 
 jeb_fs_exist(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name, bool *existp) {
-    printf("JEB::jeb_fs_exist %s\n", name);
-    return (ENOTSUP);
+    JEB_FILE_SYSTEM *jeb_fs;
+    struct statx statx;
+    struct io_uring_sqe *sqe;
+    int ret = 0;
+
+    jeb_fs = (JEB_FILE_SYSTEM *)fs;
+    sqe = io_uring_get_sqe(&jeb_fs->ring);
+    io_uring_prep_statx(sqe, 0, name, 0, 0, &statx);
+    RING_EVENT_USER_DATA *ud = malloc(sizeof(RING_EVENT_USER_DATA));
+    ud->event_type = EVENT_TYPE_NORMAL;
+    
+    /* Initialize mutex and condition variable objects */
+    pthread_mutex_init(&ud->mutex, NULL);
+    pthread_cond_init (&ud->condvar, NULL);
+    pthread_mutex_lock(&ud->mutex);
+
+    io_uring_sqe_set_data(sqe, ud);
+    io_uring_submit(&jeb_fs->ring);
+
+    // this should be in a loop to deal with spurious wakeups.
+    // should probably use pthread_cond_timedwait().
+    pthread_cond_wait(&ud->condvar, &ud->mutex);
+    pthread_mutex_unlock(&ud->mutex);
+    pthread_mutex_destroy(&ud->mutex);
+    pthread_cond_destroy(&ud->condvar);
+    ret = ud->ret_code;
+
+    free(ud);
+    printf("JEB::exist - file %s, ret = %d\n", name, ret);
+    if (ret == 0) {
+        *existp = true;
+        return (0);
+    }
+    if (-ret == ENOENT) {
+        *existp = false;
+        return (0);
+    }
+
+    return ret;
 }
 
 /* POSIX remove */
@@ -436,22 +439,44 @@ jeb_fs_directory_list_free(WT_FILE_SYSTEM *fs, WT_SESSION *session, char **dirli
 /* discard any resources on termination */
 static int jeb_fs_terminate(WT_FILE_SYSTEM *fs, WT_SESSION *session) {
     printf("JEB::jeb_fs_terminate\n");
-    return (ENOTSUP);
+    return (0);
 }
 /* ! [JEB :: FILE_SYSTEM] */
 
 /* ! [JEB :: FILE HANDLE] */
 static int 
 jeb_fh_close(WT_FILE_HANDLE *file_handle, WT_SESSION *session) {
-    printf("JEB::jeb_fh_close\n");
+    printf("JEB::jeb_fh_close - %s\n", file_handle->name);
     return (ENOTSUP);
 }
 
 /* lock/unlock a file */
 static int 
 jeb_fh_lock(WT_FILE_HANDLE *file_handle, WT_SESSION *session, bool lock) {
-    printf("JEB::jeb_fh_lock\n");
-    return (ENOTSUP);
+    // WT uses linux flock & fcntl, which isn't supported by liburing yet.
+    // thus, just copying WT's __posix_file_lock()
+    struct flock fl;
+    int ret = 0;
+    JEB_FILE_HANDLE *pfh;
+    pfh = (JEB_FILE_HANDLE *)file_handle;
+
+    /*
+     * WiredTiger requires this function be able to acquire locks past the end of file.
+     *
+     * Note we're using fcntl(2) locking: all fcntl locks associated with a file for a given process
+     * are removed when any file descriptor for the file is closed by the process, even if a lock
+     * was never requested for that file descriptor.
+     */
+    fl.l_start = 0;
+    fl.l_len = 1;
+    fl.l_type = lock ? F_WRLCK : F_UNLCK;
+    fl.l_whence = SEEK_SET;
+
+    if ((ret = fcntl(pfh->fd, F_SETLK, &fl)) != 0) {
+        fprintf(stderr, "failed to lock/unlock file: %d\n", ret);
+    }
+
+    return ret;
 }
 
 /* POSIX read :( */
@@ -465,15 +490,57 @@ jeb_fh_read(WT_FILE_HANDLE *file_handle, WT_SESSION *session, wt_off_t offset,
 
 static int 
 jeb_fh_size(WT_FILE_HANDLE *file_handle, WT_SESSION *session, wt_off_t *sizep) {
-    printf("JEB::jeb_fh_size\n");
-    return (ENOTSUP);
+    // liburing doesn't support fstat, so copying WT's __posix_file_size()
+    struct stat sb;
+    int ret = 0;
+    JEB_FILE_HANDLE *pfh;
+    pfh = (JEB_FILE_HANDLE *)file_handle;
+
+    ret = fstat(pfh->fd, &sb);
+    if (ret == 0) {
+        *sizep = sb.st_size;
+        return (0);
+    }
+    return ret;
 }
 
 /* ensure file content is stable */
 static int 
 jeb_fh_sync(WT_FILE_HANDLE *file_handle, WT_SESSION *session) {
-    printf("JEB::jeb_fh_sync\n");
-    return (ENOTSUP);
+    JEB_FILE_HANDLE *jeb_file_handle;
+    JEB_FILE_SYSTEM *jeb_fs;
+    struct io_uring_sqe *sqe;
+    int ret = 0;
+
+    printf("JEB::jeb_fh_sync - %s\n", file_handle->name);
+
+    jeb_file_handle = (JEB_FILE_HANDLE *)file_handle;
+    jeb_fs = jeb_file_handle->fs;
+
+    sqe = io_uring_get_sqe(&jeb_fs->ring);
+    io_uring_prep_fsync(sqe, jeb_file_handle->fd, 0);
+    RING_EVENT_USER_DATA *ud = malloc(sizeof(RING_EVENT_USER_DATA));
+    ud->event_type = EVENT_TYPE_NORMAL;
+
+    /* Initialize mutex and condition variable objects */
+    pthread_mutex_init(&ud->mutex, NULL);
+    pthread_cond_init (&ud->condvar, NULL);
+    pthread_mutex_lock(&ud->mutex);
+
+    io_uring_sqe_set_data(sqe, ud);
+    io_uring_submit(&jeb_fs->ring);
+
+    // this should be in a loop to deal with spurious wakeups.
+    // should probably use pthread_cond_timedwait().
+    pthread_cond_wait(&ud->condvar, &ud->mutex);
+    pthread_mutex_unlock(&ud->mutex);
+    pthread_mutex_destroy(&ud->mutex);
+    pthread_cond_destroy(&ud->condvar);
+    ret = ud->ret_code;
+
+    free(ud);
+    printf("JEB::jeb_fh_sync - ret code = %d\n", ret);
+    return ret;
 }
 
 /* ensure file content is stable */
@@ -490,12 +557,49 @@ jeb_fh_truncate(WT_FILE_HANDLE *file_handle, WT_SESSION *session, wt_off_t offse
     return (ENOTSUP);
 }
 
-/* POSIX write */
+/* POSIX write. return zero on success and a non-zero error code on failure */
 static int 
 jeb_fh_write(WT_FILE_HANDLE *file_handle, WT_SESSION *session, wt_off_t offset, 
     size_t len, const void *buf) {
-    printf("JEB::jeb_fh_write\n");
-    return (ENOTSUP);
+    JEB_FILE_HANDLE *jeb_file_handle;
+    JEB_FILE_SYSTEM *jeb_fs;
+    struct io_uring_sqe *sqe;
+    int ret = 0;
+
+    jeb_file_handle = (JEB_FILE_HANDLE *)file_handle;
+    jeb_fs = jeb_file_handle->fs;
+
+    // TODO: depending on the size of the incoming buffer, might want to break this 
+    // up into multiple SQEs. That is what WT does in __posix_file_write().
+
+    sqe = io_uring_get_sqe(&jeb_fs->ring);
+    io_uring_prep_write(sqe, jeb_file_handle->fd, buf, len, offset);
+    RING_EVENT_USER_DATA *ud = malloc(sizeof(RING_EVENT_USER_DATA));
+    ud->event_type = EVENT_TYPE_NORMAL;
+    
+    /* Initialize mutex and condition variable objects */
+    pthread_mutex_init(&ud->mutex, NULL);
+    pthread_cond_init (&ud->condvar, NULL);
+    pthread_mutex_lock(&ud->mutex);
+
+    io_uring_sqe_set_data(sqe, ud);
+    io_uring_submit(&jeb_fs->ring);
+    
+    // this should be in a loop to deal with spurious wakeups.
+    // should probably use pthread_cond_timedwait().
+    pthread_cond_wait(&ud->condvar, &ud->mutex);
+    pthread_mutex_unlock(&ud->mutex);
+    pthread_mutex_destroy(&ud->mutex);
+    pthread_cond_destroy(&ud->condvar);
+    ret = ud->ret_code;
+    free(ud);
+
+    if (ret < 0) {
+        fprintf(stderr, "failure writing to file: %s\n", strerror(ret));
+        return ret;
+    }
+
+    return 0;
 }
 
 /* Map a file into memory */
@@ -535,16 +639,11 @@ main(int args, char *argv[]) {
     WT_CONNECTION *conn;
     WT_SESSION *session;
     WT_CURSOR *cursor;
-    // CUSTOM_EVENT_HANDLER event_handler;
     int ret;
     home = "/tmp/wt_hacking";
     config = "create,session_max=10000,statistics=(all),statistics_log=(wait=1),log=(file_max=1MB,enabled=true,compressor=zstd,path=journal)," \
     "extensions=[local={entry=create_custom_file_system,early_load=true},/usr/local/lib/libwiredtiger_lz4.so,/usr/local/lib/libwiredtiger_zstd.so]," \
     "error_prefix=ERROR_JEB,verbose=[recovery_progress,checkpoint_progress,compact_progress,recovery]";
-
-    // event_handler.h.handle_error = handle_wiredtiger_error;
-    // event_handler.h.handle_message = handle_wiredtiger_message;
-    // event_handler.app_id = "jasobrown_wt_hacking";
 
     fprintf(stderr, "about to open conn\n");
     // NOTE: hit some blocking behavior when using a custom event handler, so punting for now
