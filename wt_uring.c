@@ -1,3 +1,6 @@
+#define _GNU_SOURCE
+
+#include <dirent.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/stat.h>
@@ -5,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include "wiredtiger.h"
@@ -16,6 +20,7 @@ static const char *config;
 
 #define EVENT_TYPE_SHUTDOWN 0
 #define EVENT_TYPE_NORMAL   1
+#define EVENT_TYPE_LINKED   2
 #define CQE_BATCH_SIZE      16
 
 /*
@@ -271,11 +276,10 @@ jeb_fs_open(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name ,
     WT_FS_OPEN_FILE_TYPE file_type, uint32_t flags , WT_FILE_HANDLE **file_handlep) {
     JEB_FILE_HANDLE *jeb_file_handle;
     JEB_FILE_SYSTEM *jeb_fs;
-    // WT_EXTENSION_API *wtext;
     WT_FILE_HANDLE *file_handle;
     struct io_uring_sqe *sqe;
     int ret = 0;
-    int f = 0, fd = 0;
+    int open_flags = 0, fd = 0, mode = 0;
 
     printf("JEB::jeb_fs_open %s\n", name);
 
@@ -283,19 +287,33 @@ jeb_fs_open(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name ,
     (void)file_type; /* unused */
 
     *file_handlep = NULL;
-
     jeb_fs = (JEB_FILE_SYSTEM *)fs;
     jeb_file_handle = NULL;
-    // wtext = jeb_fs->wtext;
 
-    // TODO: look to see if we've already opened the file (and have a handle to it)
+    // TODO: look to see if we've already opened the file (and have a handle to it!)
 
-    // TODO: inspect the flags to see if we should actually create the file, lol
-    // blindly assume we'll just open the file ... cuz YOLO
-    f |= O_CREAT | O_RDWR;
+    if (file_type == WT_FS_OPEN_FILE_TYPE_DIRECTORY) {
+        mode = 0444;
+        open_flags = O_RDONLY | O_CLOEXEC;
+    } else {
+        // assume regular file ....
+        open_flags = flags & WT_FS_OPEN_READONLY ? O_RDONLY : O_RDWR;
+        open_flags |= O_CLOEXEC;
+        if (flags & WT_FS_OPEN_CREATE) {
+            open_flags |= O_CREAT;
+            if (flags | WT_FS_OPEN_EXCLUSIVE) 
+                open_flags |= O_EXCL;
+            mode = 0644;
+        } else {
+            mode = 0;
+        }
+    }
+
+    // NOTE: WT sets the O_DSYNC flag on log (WAL) files. not sure if that's totally cool with io_uring,
+    // but I didn't look very hard: https://lore.kernel.org/all/CAF-ewDoqyx5knsnd_qgfRXE+CxK==PO1zF+RE=oEuv9NQq+48g@mail.gmail.com/T/
 
     sqe = io_uring_get_sqe(&jeb_fs->ring);
-    io_uring_prep_openat(sqe, 0, name, f, S_IRWXU | S_IRGRP | S_IROTH);
+    io_uring_prep_openat(sqe, 0, name, open_flags, mode);
     RING_EVENT_USER_DATA *ud = malloc(sizeof(RING_EVENT_USER_DATA));
     ud->event_type = EVENT_TYPE_NORMAL;
     
@@ -318,11 +336,12 @@ jeb_fs_open(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name ,
     free(ud);
 
     if (fd < 0) {
-        fprintf(stderr, "failed to create a new file: %s\n", strerror(ret));
+        fprintf(stderr, "failed to create a new file: %s, err: %s\n", name, strerror(ret));
         return ret;
     }
 
-    // file isn't open, so create a new handle
+    // WT does some fadvise stuff, as well. ignoring for now
+
     if ((jeb_file_handle = calloc(1, sizeof(JEB_FILE_HANDLE))) == NULL) {
         ret = ENOMEM;
         // goto err?????
@@ -338,6 +357,7 @@ jeb_fs_open(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name ,
         // goto err;
     }
 
+    // TODO: when we support mmap, update the function pointers below
     file_handle->close = jeb_fh_close;
     file_handle->fh_advise = NULL;
     file_handle->fh_extend = NULL;
@@ -449,8 +469,42 @@ jeb_fs_rename(WT_FILE_SYSTEM *fs , WT_SESSION *session, const char *from, const 
 /* get the size of file in bytes */
 static int 
 jeb_fs_size(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name, wt_off_t *sizep) {
+    // NOTE: almost exactly the same as jeb_fh_size() - only diff is args to stax()
+    JEB_FILE_SYSTEM *jeb_fs;
+    struct statx statx;
+    struct io_uring_sqe *sqe;
+    int ret = 0;
+
     printf("JEB::jeb_fs_size %s\n", name);
-    return (ENOTSUP);
+    jeb_fs = (JEB_FILE_SYSTEM *)fs;
+    sqe = io_uring_get_sqe(&jeb_fs->ring);
+    io_uring_prep_statx(sqe, 0, name, 0, 0, &statx);
+    RING_EVENT_USER_DATA *ud = malloc(sizeof(RING_EVENT_USER_DATA));
+    ud->event_type = EVENT_TYPE_NORMAL;
+    
+    /* Initialize mutex and condition variable objects */
+    pthread_mutex_init(&ud->mutex, NULL);
+    pthread_cond_init (&ud->condvar, NULL);
+    pthread_mutex_lock(&ud->mutex);
+
+    io_uring_sqe_set_data(sqe, ud);
+    io_uring_submit(&jeb_fs->ring);
+
+    // this should be in a loop to deal with spurious wakeups.
+    // should probably use pthread_cond_timedwait().
+    pthread_cond_wait(&ud->condvar, &ud->mutex);
+    pthread_mutex_unlock(&ud->mutex);
+    pthread_mutex_destroy(&ud->mutex);
+    pthread_cond_destroy(&ud->condvar);
+    ret = ud->ret_code;
+
+    free(ud);
+    if (ret == 0) {
+        *sizep = statx.stx_size;
+        return (0);
+    }
+
+    return ret;
 }
 
 /* Check if a string matches a prefix. */
@@ -664,17 +718,47 @@ jeb_fh_read(WT_FILE_HANDLE *file_handle, WT_SESSION *session, wt_off_t offset,
 
 static int 
 jeb_fh_size(WT_FILE_HANDLE *file_handle, WT_SESSION *session, wt_off_t *sizep) {
-    // liburing doesn't support fstat, so copying WT's __posix_file_size()
-    struct stat sb;
+    // NOTE: almost exactly the same as jeb_fs_size() - only diff is args to stax()
+    JEB_FILE_HANDLE *jeb_file_handle;
+    JEB_FILE_SYSTEM *jeb_fs;
+    struct statx statx;
+    struct io_uring_sqe *sqe;
     int ret = 0;
-    JEB_FILE_HANDLE *pfh;
-    pfh = (JEB_FILE_HANDLE *)file_handle;
+    int flags = 0;
 
-    ret = fstat(pfh->fd, &sb);
+    printf("JEB::jeb_fh_size %s\n", file_handle->name);
+    jeb_file_handle = (JEB_FILE_HANDLE *)file_handle;
+    jeb_fs = jeb_file_handle->fs;
+    flags |= AT_EMPTY_PATH;
+    sqe = io_uring_get_sqe(&jeb_fs->ring);
+    io_uring_prep_statx(sqe, jeb_file_handle->fd, "", flags, 0, &statx);
+    RING_EVENT_USER_DATA *ud = malloc(sizeof(RING_EVENT_USER_DATA));
+    ud->event_type = EVENT_TYPE_NORMAL;
+    
+    /* Initialize mutex and condition variable objects */
+    pthread_mutex_init(&ud->mutex, NULL);
+    pthread_cond_init (&ud->condvar, NULL);
+    pthread_mutex_lock(&ud->mutex);
+
+    io_uring_sqe_set_data(sqe, ud);
+    io_uring_submit(&jeb_fs->ring);
+
+    // this should be in a loop to deal with spurious wakeups.
+    // should probably use pthread_cond_timedwait().
+    pthread_cond_wait(&ud->condvar, &ud->mutex);
+    pthread_mutex_unlock(&ud->mutex);
+    pthread_mutex_destroy(&ud->mutex);
+    pthread_cond_destroy(&ud->condvar);
+    ret = ud->ret_code;
+
+    printf("JEB::jeb_fh_size %s, fd = %d, ret = %s\n", file_handle->name, jeb_file_handle->fd, strerror(-ret));
+
+    free(ud);
     if (ret == 0) {
-        *sizep = sb.st_size;
+        *sizep = statx.stx_size;
         return (0);
     }
+
     return ret;
 }
 
@@ -838,22 +922,22 @@ main(int args, char *argv[]) {
     home = "/tmp/wt_hacking";
     config = "create,session_max=10000,statistics=(all),statistics_log=(wait=1),log=(file_max=1MB,enabled=true,compressor=zstd,path=journal)," \
     "extensions=[local={entry=create_custom_file_system,early_load=true},/usr/local/lib/libwiredtiger_lz4.so,/usr/local/lib/libwiredtiger_zstd.so]," \
-    "error_prefix=ERROR_JEB,verbose=[recovery_progress,checkpoint_progress,compact_progress,recovery]";
+    "error_prefix=MSG_JEB,verbose=[recovery_progress,checkpoint_progress,compact_progress,recovery]";
 
-    fprintf(stderr, "about to open conn\n");
+    fprintf(stderr, "*** JEB::main - about to open conn\n");
     // NOTE: hit some blocking behavior when using a custom event handler, so punting for now
     // if((ret = wiredtiger_open(home, (WT_EVENT_HANDLER *)&event_handler, config, &conn)) != 0) {
     if((ret = wiredtiger_open(home, NULL, config, &conn)) != 0) {
         fprintf(stderr, "failed to open dir: %s\n", wiredtiger_strerror(ret));
         return -1;
     }
-    fprintf(stderr, "about to open session\n");
+    fprintf(stderr, "*** JEB::main - about to open session\n");
     if((ret = conn->open_session(conn, NULL, NULL, &session)) != 0) {
         fprintf(stderr, "failed to open session: %s\n", wiredtiger_strerror(ret));
         return -1;
     }
 
-    fprintf(stderr, "about create table\n");
+    fprintf(stderr, "*** JEB::main - about create table\n");
     if ((ret = session->create(session, "table:jeb1", "key_format=S,value_format=S")) != 0) {
         fprintf(stderr, "failed to create table: %s\n", wiredtiger_strerror(ret));
         return -1;
@@ -865,6 +949,7 @@ main(int args, char *argv[]) {
     }
 
     // FINALLY, insert some data :)
+    fprintf(stderr, "*** JEB::main - about to write data\n");
     cursor->set_key(cursor, "key1");
     cursor->set_value(cursor, "val1");
     if ((ret = cursor->insert(cursor)) != 0) {
@@ -877,7 +962,7 @@ main(int args, char *argv[]) {
     while((ret = cursor->next(cursor)) == 0) {
         cursor->get_key(cursor, &key);
         cursor->get_value(cursor, &value);
-        printf("next record: %s : %s\n", key, value);
+        printf("*** JEB::main - next record: %s : %s\n", key, value);
     }
     //scan_end_check(ret == WT_NOTFOUND);
 
@@ -885,7 +970,7 @@ main(int args, char *argv[]) {
     // fprintf(stderr, "about to sleep\n");
     // sleep(10);
 
-    fprintf(stderr, "about to close session\n");
+    fprintf(stderr, "*** JEB::main - about to close session\n");
     if((ret = conn->close(conn, NULL)) != 0) {
         fprintf(stderr, "failed to close connection: %s\n", wiredtiger_strerror(ret));
         return -1;
