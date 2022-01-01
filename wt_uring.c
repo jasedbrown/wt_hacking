@@ -1,9 +1,11 @@
+#include <dirent.h>
 #include <fcntl.h>
+#include <linux/stat.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
-#include <linux/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include "wiredtiger.h"
 #include "wiredtiger_ext.h"
@@ -162,7 +164,7 @@ void *ring_consumer(void *data) {
                 // not sure when we'd get 0 count if the eventfd triggered, unless spurious :shrug:
                 break;
             }
-            printf("JEB::ring_consumer - next batch count = %d\n", cnt);
+            // printf("JEB::ring_consumer - next batch count = %d\n", cnt);
             
             cqe = *cqes;
             for (int i = 0; i < cnt; i++, cqe++) {
@@ -388,7 +390,6 @@ jeb_fs_exist(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name, bool *ex
     ret = ud->ret_code;
 
     free(ud);
-    printf("JEB::exist - file %s, ret = %d\n", name, ret);
     if (ret == 0) {
         *existp = true;
         return (0);
@@ -404,14 +405,45 @@ jeb_fs_exist(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name, bool *ex
 /* POSIX remove */
 static int 
 jeb_fs_remove(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name, uint32_t flags) {
+    // io_uring doesn't support unlink(), so copying WT's __posix_fs_remove().
+    // NOTE: completely ignoring that we'd need to flush the parent directory(ies), as well,
+    // cuz this is PoC.
+
     printf("JEB::jeb_fs_remove %s\n", name);
-    return (ENOTSUP);
+    int ret = 0;
+
+    /*
+     * ISO C doesn't require rename return -1 on failure or set errno (note POSIX 1003.1 extends C
+     * with those requirements). Be cautious, force any non-zero return to -1 so we'll check errno.
+     * We can still end up with the wrong errno (if errno is garbage), or the generic WT_ERROR
+     * return (if errno is 0), but we've done the best we can.
+     */
+    if ((ret = unlink(name)) != 0) {
+        fprintf(stderr, "failed remove (delete) %s, err: %s\n", name, strerror(ret));
+        return ret;
+    }
+    return 0;
 }
 
 static int 
 jeb_fs_rename(WT_FILE_SYSTEM *fs , WT_SESSION *session, const char *from, const char *to, uint32_t flags) {
-    printf("JEB::jeb_fs_rename\n");
-    return (ENOTSUP);
+    int ret = 0;
+    
+    printf("JEB::jeb_fs_rename - from: %s => %s\n", from, to);
+    // io_uring doesn't support rename(), so copying WT's __posix_fs_rename().
+    // NOTE: completely ignoring that we'd need to flush the parent directory(ies), as well,
+    // cuz this is PoC.
+    /*
+     * ISO C doesn't require rename return -1 on failure or set errno (note POSIX 1003.1 extends C
+     * with those requirements). Be cautious, force any non-zero return to -1 so we'll check errno.
+     * We can still end up with the wrong errno (if errno is garbage), or the generic WT_ERROR
+     * return (if errno is 0), but we've done the best we can.
+     */
+    if ((ret = rename(from, to)) != 0) {
+        fprintf(stderr, "failed rename %s to %s, err: %s\n", from, to, strerror(ret));
+        return ret;
+    }
+    return 0;
 }
 
 /* get the size of file in bytes */
@@ -421,19 +453,93 @@ jeb_fs_size(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name, wt_off_t 
     return (ENOTSUP);
 }
 
+/* Check if a string matches a prefix. */
+#define JEB_PREFIX_MATCH(str, pfx) \
+    (((const char *)(str))[0] == ((const char *)(pfx))[0] && strncmp(str, pfx, strlen(pfx)) == 0)
+
 /* return a list of files in a given sub-directory */
 static int 
 jeb_fs_directory_list(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *directory, 
     const char *prefix, char ***dirlistp, uint32_t *countp) {
-    printf("JEB::jeb_fs_directory_list %s\n", directory);
-    return (ENOTSUP);
+    // io_uring doesn't support syscalls to list a directory.
+    // thus, copying WT's__directory_list_worker()
+
+    struct dirent *dp;
+    DIR *dirp;
+    size_t dirallocsz;
+    uint32_t count;
+    char **entries;
+    int ret = 0;
+
+    *dirlistp = NULL;
+    *countp = 0;
+    dirp = NULL;
+    dirallocsz = 0;
+    entries = NULL;
+
+    printf("JEB::jeb_fs_directory_list - dir: %s, prefix: %s\n", directory, prefix);
+
+    /*
+     * If opendir fails, we should have a NULL pointer with an error value, but various static
+     * analysis programs remain unconvinced, check both.
+     */
+    if ((dirp = opendir(directory)) == NULL || errno != 0) {
+        ret = EINVAL;
+    }
+
+    for (count = 0; (dp = readdir(dirp)) != NULL;) {
+        /*
+         * Skip . and ..
+         */
+        if (strcmp(dp->d_name, ".") == 0 || strcmp(dp->d_name, "..") == 0)
+            continue;
+
+        /* The list of files is optionally filtered by a prefix. */
+        if (prefix != NULL && !JEB_PREFIX_MATCH(dp->d_name, prefix))
+            continue;
+
+        // TODO: implement me
+
+        // WT_ERR(__wt_realloc_def(session, &dirallocsz, count + 1, &entries));
+        // WT_ERR(__wt_strdup(session, dp->d_name, &entries[count]));
+        // ++count;
+    }
+
+    *dirlistp = entries;
+    *countp = count;
+    return 0;
+
+// err:
+//     WT_SYSCALL(closedir(dirp), tret);
+//     if (tret != 0) {
+//         __wt_err(session, tret, "%s: directory-list: closedir", directory);
+//         if (ret == 0)
+//             ret = tret;
+//     }
+
+//     if (ret == 0)
+//         return (0);
+
+//     WT_TRET(__wt_posix_directory_list_free(file_system, wt_session, entries, count));
+
+//     WT_RET_MSG(
+//       session, ret, "%s: directory-list, prefix \"%s\"", directory, prefix == NULL ? "" : prefix);
 }
 
 /* free memory allocated by jeb_fs_directory_list */
 static int 
 jeb_fs_directory_list_free(WT_FILE_SYSTEM *fs, WT_SESSION *session, char **dirlist, uint32_t count) {
     printf("JEB::jeb_fs_directory_list_free\n");
-    return (ENOTSUP);
+
+    // TODO: implement me
+
+    if (dirlist != NULL) {
+        while (count > 0) {
+        //     __wt_free(session, dirlist[--count]);
+        }
+        // __wt_free(session, dirlist);
+    }
+    return 0;
 }
 
 /* discard any resources on termination */
@@ -447,7 +553,37 @@ static int jeb_fs_terminate(WT_FILE_SYSTEM *fs, WT_SESSION *session) {
 static int 
 jeb_fh_close(WT_FILE_HANDLE *file_handle, WT_SESSION *session) {
     printf("JEB::jeb_fh_close - %s\n", file_handle->name);
-    return (ENOTSUP);
+    JEB_FILE_HANDLE *jeb_file_handle;
+    JEB_FILE_SYSTEM *jeb_fs;
+    struct io_uring_sqe *sqe;
+    int ret = 0;
+
+    jeb_file_handle = (JEB_FILE_HANDLE *)file_handle;
+    jeb_fs = jeb_file_handle->fs;
+
+    sqe = io_uring_get_sqe(&jeb_fs->ring);
+    io_uring_prep_close(sqe, jeb_file_handle->fd);
+    RING_EVENT_USER_DATA *ud = malloc(sizeof(RING_EVENT_USER_DATA));
+    ud->event_type = EVENT_TYPE_NORMAL;
+
+    /* Initialize mutex and condition variable objects */
+    pthread_mutex_init(&ud->mutex, NULL);
+    pthread_cond_init (&ud->condvar, NULL);
+    pthread_mutex_lock(&ud->mutex);
+
+    io_uring_sqe_set_data(sqe, ud);
+    io_uring_submit(&jeb_fs->ring);
+
+    // this should be in a loop to deal with spurious wakeups.
+    // should probably use pthread_cond_timedwait().
+    pthread_cond_wait(&ud->condvar, &ud->mutex);
+    pthread_mutex_unlock(&ud->mutex);
+    pthread_mutex_destroy(&ud->mutex);
+    pthread_cond_destroy(&ud->condvar);
+    ret = ud->ret_code;
+
+    free(ud);
+    return ret;
 }
 
 /* lock/unlock a file */
@@ -479,12 +615,50 @@ jeb_fh_lock(WT_FILE_HANDLE *file_handle, WT_SESSION *session, bool lock) {
     return ret;
 }
 
-/* POSIX read :( */
+/* POSIX read */
 static int 
 jeb_fh_read(WT_FILE_HANDLE *file_handle, WT_SESSION *session, wt_off_t offset, 
     size_t len, void *buf) {
-    printf("JEB::jeb_fh_read\n");
-    return (ENOTSUP);
+    printf("JEB::jeb_fh_read - %s\n", file_handle->name);
+    JEB_FILE_HANDLE *jeb_file_handle;
+    JEB_FILE_SYSTEM *jeb_fs;
+    struct io_uring_sqe *sqe;
+    int ret = 0;
+
+    jeb_file_handle = (JEB_FILE_HANDLE *)file_handle;
+    jeb_fs = jeb_file_handle->fs;
+
+    // TODO: depending on the size of the incoming buffer, might want to break this 
+    // up into multiple SQEs. That is what WT does in __posix_file_read().
+
+    sqe = io_uring_get_sqe(&jeb_fs->ring);
+    io_uring_prep_read(sqe, jeb_file_handle->fd, buf, len, offset);
+    RING_EVENT_USER_DATA *ud = malloc(sizeof(RING_EVENT_USER_DATA));
+    ud->event_type = EVENT_TYPE_NORMAL;
+    
+    /* Initialize mutex and condition variable objects */
+    pthread_mutex_init(&ud->mutex, NULL);
+    pthread_cond_init (&ud->condvar, NULL);
+    pthread_mutex_lock(&ud->mutex);
+
+    io_uring_sqe_set_data(sqe, ud);
+    io_uring_submit(&jeb_fs->ring);
+    
+    // this should be in a loop to deal with spurious wakeups.
+    // should probably use pthread_cond_timedwait().
+    pthread_cond_wait(&ud->condvar, &ud->mutex);
+    pthread_mutex_unlock(&ud->mutex);
+    pthread_mutex_destroy(&ud->mutex);
+    pthread_cond_destroy(&ud->condvar);
+    ret = ud->ret_code;
+    free(ud);
+
+    if (ret < 0) {
+        fprintf(stderr, "failure reading from file: %s\n", strerror(ret));
+        return ret;
+    }
+
+    return 0;
 }
 
 
@@ -539,7 +713,6 @@ jeb_fh_sync(WT_FILE_HANDLE *file_handle, WT_SESSION *session) {
     ret = ud->ret_code;
 
     free(ud);
-    printf("JEB::jeb_fh_sync - ret code = %d\n", ret);
     return ret;
 }
 
@@ -552,9 +725,31 @@ jeb_fh_sync_nowait(WT_FILE_HANDLE *file_handle, WT_SESSION *session) {
 
 /* POSIX truncate */
 static int 
-jeb_fh_truncate(WT_FILE_HANDLE *file_handle, WT_SESSION *session, wt_off_t offset) {
-    printf("JEB::jeb_fh_truncate\n");
-    return (ENOTSUP);
+jeb_fh_truncate(WT_FILE_HANDLE *file_handle, WT_SESSION *session, wt_off_t len) {
+    JEB_FILE_HANDLE *jeb_file_handle;
+    int ret = 0;
+
+    printf("JEB::jeb_fh_truncate - %s, new len: %ld\n", file_handle->name, len);
+    jeb_file_handle = (JEB_FILE_HANDLE *)file_handle;
+
+    // TODO: re-enable this mmap stuffs
+    // remap = (len != pfh->mmap_size);
+    // if (remap)
+    //     __wt_prepare_remap_resize_file(file_handle, wt_session);
+
+    if ((ret = ftruncate(jeb_file_handle->fd, len)) != 0) {
+        fprintf(stderr, "failed to truncate %s, err: %s\n", file_handle->name, strerror(ret));
+        return ret;
+    }
+    // if (remap) {
+    //     if (ret == 0)
+    //         __wt_remap_resize_file(file_handle, wt_session);
+    //     else {
+    //         __wt_release_without_remap(file_handle);
+    //         WT_RET_MSG(session, ret, "%s: handle-truncate: ftruncate", file_handle->name);
+    //     }
+    // }
+    return (0);
 }
 
 /* POSIX write. return zero on success and a non-zero error code on failure */
