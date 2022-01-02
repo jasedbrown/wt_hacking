@@ -91,6 +91,8 @@ static int jeb_fs_terminate(WT_FILE_SYSTEM *, WT_SESSION *);
 * Forward function declarations for file handle API.
 */
 static int jeb_fh_close(WT_FILE_HANDLE *, WT_SESSION *);
+static int jeb_fh_extend(WT_FILE_HANDLE *, WT_SESSION *, wt_off_t offset);
+static int jeb_fh_extend_nolock(WT_FILE_HANDLE *, WT_SESSION *, wt_off_t offset);
 static int jeb_fh_lock(WT_FILE_HANDLE *, WT_SESSION *, bool);
 static int jeb_fh_read(WT_FILE_HANDLE *, WT_SESSION *, wt_off_t, size_t, void *);
 static int jeb_fh_size(WT_FILE_HANDLE *, WT_SESSION *, wt_off_t *);
@@ -141,7 +143,7 @@ int init_io_uring(struct io_uring *ring, int efd) {
 * check the ring for CQEs. For each CQE available, poke the "lock"
 * in the user_data to awaken the blocked read/write thread.
 *
-* This thread will not free any memory, except for the SHUTDOWN event message.
+* This thread will not free any memory.
 */
 void *ring_consumer(void *data) {
     struct io_uring_cqe *cqes[CQE_BATCH_SIZE];
@@ -169,26 +171,20 @@ void *ring_consumer(void *data) {
                 // not sure when we'd get 0 count if the eventfd triggered, unless spurious :shrug:
                 break;
             }
-            // printf("JEB::ring_consumer - next batch count = %d\n", cnt);
+//            printf("JEB::ring_consumer - next batch count = %d\n", cnt);
             
             cqe = *cqes;
             for (int i = 0; i < cnt; i++, cqe++) {
                 ud = io_uring_cqe_get_data(cqe);
-                
-                switch(ud->event_type){
-                    case EVENT_TYPE_NORMAL:
-                        // NOTE: there could be some nasty thread blocks here if the timing is unlucky 
-                        // (if the producing thread hasn't called pthread_cond_wait() yet).
-                        pthread_mutex_lock(&ud->mutex); // <- i think i need to do this, but not sure yet (or do it at submission??)
-                        ud->ret_code = cqe->res;
-                        pthread_cond_signal(&ud->condvar);
-                        pthread_mutex_unlock(&ud->mutex);
-                        break;
-                    case EVENT_TYPE_SHUTDOWN:
-                        printf("CONSUMER:: handle shutdown event\n");
-                        must_exit = true;
-                        free(ud);
-                        break;
+                // NOTE: there could be some nasty thread blocks here if the timing is unlucky 
+                // (if the producing thread hasn't called pthread_cond_wait() yet).
+                pthread_mutex_lock(&ud->mutex); // <- i think i need to do this, but not sure yet (or do it at submission??)
+                ud->ret_code = cqe->res;
+                pthread_cond_signal(&ud->condvar);
+                pthread_mutex_unlock(&ud->mutex);
+
+                if (ud->event_type == EVENT_TYPE_SHUTDOWN) {
+                    must_exit = true;
                 }
 
                 // TODO: see if there's a way to batch update the pointer here, instead of doing it one at a time.
@@ -290,8 +286,6 @@ jeb_fs_open(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name ,
     jeb_fs = (JEB_FILE_SYSTEM *)fs;
     jeb_file_handle = NULL;
 
-    // TODO: look to see if we've already opened the file (and have a handle to it!)
-
     if (file_type == WT_FS_OPEN_FILE_TYPE_DIRECTORY) {
         mode = 0444;
         open_flags = O_RDONLY | O_CLOEXEC;
@@ -360,8 +354,8 @@ jeb_fs_open(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *name ,
     // TODO: when we support mmap, update the function pointers below
     file_handle->close = jeb_fh_close;
     file_handle->fh_advise = NULL;
-    file_handle->fh_extend = NULL;
-    file_handle->fh_extend_nolock = NULL;
+    file_handle->fh_extend = jeb_fh_extend;
+    file_handle->fh_extend_nolock = jeb_fh_extend_nolock;
     file_handle->fh_lock = jeb_fh_lock;
     file_handle->fh_map = jeb_fh_map;
     file_handle->fh_map_discard = jeb_fh_map_discard;
@@ -520,7 +514,7 @@ jeb_fs_directory_list(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *direc
 
     struct dirent *dp;
     DIR *dirp;
-    size_t dirallocsz;
+    // size_t dirallocsz;
     uint32_t count;
     char **entries;
     int ret = 0;
@@ -528,7 +522,7 @@ jeb_fs_directory_list(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *direc
     *dirlistp = NULL;
     *countp = 0;
     dirp = NULL;
-    dirallocsz = 0;
+    // dirallocsz = 0;
     entries = NULL;
 
     printf("JEB::jeb_fs_directory_list - dir: %s, prefix: %s\n", directory, prefix);
@@ -561,7 +555,7 @@ jeb_fs_directory_list(WT_FILE_SYSTEM *fs, WT_SESSION *session, const char *direc
 
     *dirlistp = entries;
     *countp = count;
-    return 0;
+    return ret;
 
 // err:
 //     WT_SYSCALL(closedir(dirp), tret);
@@ -596,9 +590,47 @@ jeb_fs_directory_list_free(WT_FILE_SYSTEM *fs, WT_SESSION *session, char **dirli
     return 0;
 }
 
-/* discard any resources on termination */
-static int jeb_fs_terminate(WT_FILE_SYSTEM *fs, WT_SESSION *session) {
-    printf("JEB::jeb_fs_terminate\n");
+/* 
+* discard any resources on termination.
+* send the ring_consumer thread a special message to tell it to 
+* stop blocking on the uring. then shutdown the uring.
+*/
+static int 
+jeb_fs_terminate(WT_FILE_SYSTEM *fs, WT_SESSION *session) {
+    JEB_FILE_SYSTEM *jeb_fs;
+    struct io_uring_sqe *sqe;
+    int ret = 0;
+
+    jeb_fs = (JEB_FILE_SYSTEM *)fs;
+
+    printf("JEB::jeb_fs_terminate HEAD\n");
+    sqe = io_uring_get_sqe(&jeb_fs->ring);
+    io_uring_prep_nop(sqe);
+    RING_EVENT_USER_DATA *ud = malloc(sizeof(RING_EVENT_USER_DATA));
+    ud->event_type = EVENT_TYPE_SHUTDOWN;
+
+    /* Initialize mutex and condition variable objects */
+    pthread_mutex_init(&ud->mutex, NULL);
+    pthread_cond_init (&ud->condvar, NULL);
+    pthread_mutex_lock(&ud->mutex);
+
+    io_uring_sqe_set_data(sqe, ud);
+    io_uring_submit(&jeb_fs->ring);
+
+    // this should be in a loop to deal with spurious wakeups.
+    // should probably use pthread_cond_timedwait().
+    pthread_cond_wait(&ud->condvar, &ud->mutex);
+    pthread_mutex_unlock(&ud->mutex);
+    pthread_mutex_destroy(&ud->mutex);
+    pthread_cond_destroy(&ud->condvar);
+    free(ud);
+
+    io_uring_queue_exit(&jeb_fs->ring);
+
+    if ((ret = close(jeb_fs->efd)) != 0) {
+        fprintf(stderr, "problem closing eventd used with io_uring. ignoring but error is %s\n", strerror(ret));
+    }
+
     return (0);
 }
 /* ! [JEB :: FILE_SYSTEM] */
@@ -606,7 +638,6 @@ static int jeb_fs_terminate(WT_FILE_SYSTEM *fs, WT_SESSION *session) {
 /* ! [JEB :: FILE HANDLE] */
 static int 
 jeb_fh_close(WT_FILE_HANDLE *file_handle, WT_SESSION *session) {
-    printf("JEB::jeb_fh_close - %s\n", file_handle->name);
     JEB_FILE_HANDLE *jeb_file_handle;
     JEB_FILE_SYSTEM *jeb_fs;
     struct io_uring_sqe *sqe;
@@ -615,6 +646,7 @@ jeb_fh_close(WT_FILE_HANDLE *file_handle, WT_SESSION *session) {
     jeb_file_handle = (JEB_FILE_HANDLE *)file_handle;
     jeb_fs = jeb_file_handle->fs;
 
+    printf("JEB::jeb_fh_close - %s\n", file_handle->name);
     sqe = io_uring_get_sqe(&jeb_fs->ring);
     io_uring_prep_close(sqe, jeb_file_handle->fd);
     RING_EVENT_USER_DATA *ud = malloc(sizeof(RING_EVENT_USER_DATA));
@@ -638,6 +670,50 @@ jeb_fh_close(WT_FILE_HANDLE *file_handle, WT_SESSION *session) {
 
     free(ud);
     return ret;
+}
+
+static int 
+jeb_fh_extend(WT_FILE_HANDLE *file_handle, WT_SESSION *session, wt_off_t offset) {
+    JEB_FILE_HANDLE *jeb_file_handle;
+    JEB_FILE_SYSTEM *jeb_fs;
+    struct io_uring_sqe *sqe;
+    int ret = 0;
+
+    jeb_file_handle = (JEB_FILE_HANDLE *)file_handle;
+    jeb_fs = jeb_file_handle->fs;
+
+    // TODO: there's a bunch of extra logic around the extend() functions in WT
+    // wrt mapping the file (to prevent races). will need to account for that  ...
+
+    printf("JEB::jeb_fh_extend - %s\n", file_handle->name);
+    sqe = io_uring_get_sqe(&jeb_fs->ring);
+    io_uring_prep_fallocate(sqe, jeb_file_handle->fd, 0, (wt_off_t)0, offset);
+    RING_EVENT_USER_DATA *ud = malloc(sizeof(RING_EVENT_USER_DATA));
+    ud->event_type = EVENT_TYPE_NORMAL;
+
+    /* Initialize mutex and condition variable objects */
+    pthread_mutex_init(&ud->mutex, NULL);
+    pthread_cond_init (&ud->condvar, NULL);
+    pthread_mutex_lock(&ud->mutex);
+
+    io_uring_sqe_set_data(sqe, ud);
+    io_uring_submit(&jeb_fs->ring);
+
+    // this should be in a loop to deal with spurious wakeups.
+    // should probably use pthread_cond_timedwait().
+    pthread_cond_wait(&ud->condvar, &ud->mutex);
+    pthread_mutex_unlock(&ud->mutex);
+    pthread_mutex_destroy(&ud->mutex);
+    pthread_cond_destroy(&ud->condvar);
+    ret = ud->ret_code;
+
+    free(ud);
+    return ret;
+}
+
+static int 
+jeb_fh_extend_nolock(WT_FILE_HANDLE *file_handle, WT_SESSION *session, wt_off_t offset) {
+    return jeb_fh_extend(file_handle, session, offset);
 }
 
 /* lock/unlock a file */
@@ -718,7 +794,7 @@ jeb_fh_read(WT_FILE_HANDLE *file_handle, WT_SESSION *session, wt_off_t offset,
 
 static int 
 jeb_fh_size(WT_FILE_HANDLE *file_handle, WT_SESSION *session, wt_off_t *sizep) {
-    // NOTE: almost exactly the same as jeb_fs_size() - only diff is args to stax()
+    // NOTE: almost exactly the same as jeb_fs_size() - only diff is args to statx()
     JEB_FILE_HANDLE *jeb_file_handle;
     JEB_FILE_SYSTEM *jeb_fs;
     struct statx statx;
@@ -750,8 +826,6 @@ jeb_fh_size(WT_FILE_HANDLE *file_handle, WT_SESSION *session, wt_off_t *sizep) {
     pthread_mutex_destroy(&ud->mutex);
     pthread_cond_destroy(&ud->condvar);
     ret = ud->ret_code;
-
-    printf("JEB::jeb_fh_size %s, fd = %d, ret = %s\n", file_handle->name, jeb_file_handle->fd, strerror(-ret));
 
     free(ud);
     if (ret == 0) {
@@ -812,6 +886,9 @@ static int
 jeb_fh_truncate(WT_FILE_HANDLE *file_handle, WT_SESSION *session, wt_off_t len) {
     JEB_FILE_HANDLE *jeb_file_handle;
     int ret = 0;
+
+    // TODO: there's a bunch of extra logic around the truncate() functions in WT
+    // wrt mapping the file (to prevent races). will need to account for that  ...
 
     printf("JEB::jeb_fh_truncate - %s, new len: %ld\n", file_handle->name, len);
     jeb_file_handle = (JEB_FILE_HANDLE *)file_handle;
